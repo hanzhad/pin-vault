@@ -1,0 +1,587 @@
+#!/usr/bin/env bash
+#
+# pin-vault: one PIN, every token a machine needs handed over after a reboot
+# One file per token in ~/.local/share/pin-vault/, named for what
+# it is (gate, engine, api-token); the file holds the command that wants
+# the token and the token, both under the PIN. Without the PIN only the names
+# are visible. Run it with no arguments for the commands.
+#
+# A file is  wrap( AES-256-CBC( "pin-vault3" \n receiver \n base64(value) \n
+# base64(note) \n sha256 ) ) with the key from PBKDF2(pin, 600000). The note is
+# one line the owner keeps beside the token (what it is for, when to rotate it),
+# empty for none, and is under the PIN like the rest. The value is any bytes, one line or a
+# key of many, up to 64 KiB; the record is line based, so it is kept in base64
+# on one line, and the script holds only that form, decoding as a pipe to the
+# reader. `add <name> --stdin` takes all of stdin as the value, byte for byte;
+# at a terminal that is a hidden paste, ended with Ctrl-D (twice if the text
+# does not end in a newline), with echo off and restored on every way out.
+# `pin-vault2` files (the same without the note line, the digest over three
+# lines) and `pin-vault1` files (the token as the third line, typed, one line)
+# are still read, as entries with no note, so files written by earlier versions keep
+# working; nothing rewrites one until the entry is next stored (update, repin).
+# `update` changes one part of an entry, the token, the receiver or the note,
+# and stores the other two as they were. `openssl enc` has no authenticated
+# mode, and an HMAC key on an `openssl` command line is an argument, so the
+# integrity is inside the encryption: the SHA-256 of the lines before
+# it (four for a version 3 file, the base64 lines as they are stored). A wrong PIN is a bad pad or a wrong
+# digest; a changed byte anywhere is one of those too, or a bad length. Either way it is found by a first
+# decrypt that only compares, before a second one hands the token to anyone.
+# The PIN is stored nowhere, not even as a hash: the file opening is the proof.
+#
+# `wrap` is the outer layer, DPAPI under WSL or the login Keychain on a mac
+# (PIN_VAULT_WRAP overrides, which is how the tests run without either): a
+# copied file is useless elsewhere, so the PIN can only be tried on this
+# machine, as this user. The PIN and the token cross into openssl on a file
+# descriptor, and a value reaches its receiver on stdin; the receiver is
+# split on spaces and run as argv, never through a shell. Outside a pipe a
+# value is only ever in this process's own shell variables, as base64 (add,
+# update, repin), or as the typed token before it is encoded, or in the check
+# that reads a version 1 token and drops it; `printf` is a builtin, so it
+# never reaches an argument, the environment or a file. A note is held the same
+# way, as base64, though it is no secret of the same kind.
+#
+# PIN_VAULT_HOME moves the folder and PIN_VAULT_INPUT_FD makes every prompt
+# read a line from that descriptor instead of the terminal; both are for the
+# tests, and so is PIN_VAULT_KEY_FD: `get` and `update` with no name, and
+# `update` with no flag, show a menu moved by the arrow keys, which reads from /dev/tty and draws on it, and with that
+# set it reads raw keys from that descriptor and draws on stderr instead.
+# Bash 3.2 and coreutils, so it runs on a mac as it comes.
+set -uo pipefail
+umask 077
+
+self=${BASH_SOURCE[0]}
+while [ -L "$self" ]; do
+  d=$(cd "$(dirname "$self")" && pwd); self=$(readlink "$self")
+  case $self in /*) ;; *) self=$d/$self ;; esac
+done
+here=$(cd "$(dirname "$self")" && pwd)
+dir=${PIN_VAULT_HOME:-$HOME/.local/share/pin-vault}
+iter=600000
+if [ -n "${PIN_VAULT_TEST_ITER:-}" ]; then
+  case $PIN_VAULT_TEST_ITER in
+    *[!0-9]*) ;;
+    *) [ "$PIN_VAULT_TEST_ITER" -ge 1000 ] 2>/dev/null && iter=$PIN_VAULT_TEST_ITER ;;
+  esac
+fi
+wrap=""
+pin=""
+ok_name=""
+ok_recv=""
+enc=""
+note_enc=""
+tty_saved=""
+max_value=65536
+
+err() { echo "✗ $*" >&2; }
+
+pick_wrap() {
+  if [ -n "${PIN_VAULT_WRAP:-}" ]; then wrap=$PIN_VAULT_WRAP; return 0; fi
+  case $(uname -s) in
+    Darwin) wrap=$here/macos/keychain.sh ;;
+    Linux)
+      if grep -qi microsoft /proc/version 2>/dev/null; then wrap=$here/windows/dpapi.sh
+      else err "no outer layer on this system: set PIN_VAULT_WRAP to a program with wrap and unwrap"; return 69; fi ;;
+    *) err "no outer layer on this system: set PIN_VAULT_WRAP to a program with wrap and unwrap"; return 69 ;;
+  esac
+}
+
+# ask <var> <prompt> [s]: one line into $var, hidden with s. From the terminal,
+# or from PIN_VAULT_INPUT_FD when that is set.
+ask() {
+  if [ -n "${PIN_VAULT_INPUT_FD:-}" ]; then
+    IFS= read -r -u "$PIN_VAULT_INPUT_FD" "$1" || return 1
+  else
+    [ -r /dev/tty ] || { err "needs a terminal: the PIN and the token are read from it"; return 1; }
+    IFS= read -r ${3:+-s} -p "$2" "$1" </dev/tty || return 1
+    [ -z "${3:-}" ] || echo >&2
+  fi
+}
+
+valid_name() { case $1 in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; esac; }
+
+list_names() {
+  local f n
+  for f in "$dir"/*.bin; do
+    [ -f "$f" ] || continue
+    n=${f##*/}; echo "${n%.bin}"
+  done
+}
+
+# exists <name>: the name is well formed and has a file.
+exists() {
+  valid_name "$1" || { err "a name is letters, digits, . _ - and starts with a letter or digit"; return 64; }
+  [ -f "$dir/$1.bin" ] || { err "nothing stored as $1: pin-vault status lists the names"; return 66; }
+}
+
+# menu_wanted: a menu can be shown: the test seam is set, or there is a
+# terminal and no PIN_VAULT_INPUT_FD feeding the prompts.
+menu_wanted() {
+  [ -z "${PIN_VAULT_KEY_FD:-}" ] || return 0
+  [ -z "${PIN_VAULT_INPUT_FD:-}" ] && { : </dev/tty; } 2>/dev/null
+}
+
+# menu_draw: the lines of the menu, from the cursor's line, with $sel inverted.
+menu_draw() {
+  local i
+  printf '\r\033[Kchoose with up and down, enter to pick, esc to cancel\n' >&"$kout"
+  for ((i = 0; i < ${#items[@]}; i++)); do
+    if [ $i -eq $sel ]; then printf '\r\033[K\033[7m  > %s\033[0m\n' "${items[i]}" >&"$kout"
+    else printf '\r\033[K    %s\n' "${items[i]}" >&"$kout"; fi
+  done
+}
+
+# menu <var> <name>...: arrow keys and Enter choose, Esc, q or Ctrl-C cancel.
+# Keys come from /dev/tty, which is also where the menu is drawn, so stdout
+# stays the token's; PIN_VAULT_KEY_FD reads them from a descriptor and draws on
+# stderr. A lone Esc waits a second for the rest of an arrow (bash 3.2's read
+# -t takes whole seconds). Bash puts the terminal back to ISIG inside `read`, so
+# Ctrl-C is a SIGINT, not a key, and a trapped one restarts the read: the read
+# times out every second so the flag the trap sets is seen within one. The
+# menu erases itself and the cursor comes back on every way out.
+menu() {
+  local var=$1 k k2 kin kout saved="" sel=0 cancelled=0 chose=0
+  local -a items
+  shift
+  items=("$@")
+  if [ -n "${PIN_VAULT_KEY_FD:-}" ]; then kin=$PIN_VAULT_KEY_FD; kout=2
+  else exec 9<>/dev/tty; kin=9; kout=9; saved=$(stty -g <&9 2>/dev/null); stty -echo <&9 2>/dev/null; fi
+  trap 'cancelled=1' INT
+  printf '\033[?25l' >&"$kout"
+  menu_draw
+  while [ $cancelled -eq 0 ] && [ $chose -eq 0 ]; do
+    IFS= read -rsn1 -t 1 -u "$kin" k || { [ $? -gt 128 ] && continue; cancelled=1; break; }
+    case $k in
+      ''|$'\r') chose=1; continue ;;
+      q|$'\003') cancelled=1; continue ;;
+      $'\033')
+        IFS= read -rsn1 -t 1 -u "$kin" k2 || { cancelled=1; continue; }
+        case $k2 in '['|O) ;; *) continue ;; esac
+        IFS= read -rsn1 -t 1 -u "$kin" k2 || continue
+        case $k2 in
+          A) sel=$(( (sel + ${#items[@]} - 1) % ${#items[@]} )) ;;
+          B) sel=$(( (sel + 1) % ${#items[@]} )) ;;
+          *) continue ;;
+        esac ;;
+      *) continue ;;
+    esac
+    printf '\033[%dA' $(( ${#items[@]} + 1 )) >&"$kout"
+    menu_draw
+  done
+  printf '\033[%dA\033[J\033[?25h' $(( ${#items[@]} + 1 )) >&"$kout"
+  trap - INT
+  if [ -n "$saved" ]; then stty "$saved" <&9 2>/dev/null; fi
+  if [ "$kin" = 9 ]; then exec 9<&-; fi
+  [ $chose -eq 1 ] && [ $cancelled -eq 0 ] || return 1
+  printf -v "$var" %s "${items[sel]}"
+}
+
+# pick <var>: the menu at a terminal, else a numbered list on stderr, answered
+# by number or name.
+pick() {
+  local names n a i=0
+  names=$(list_names)
+  [ -n "$names" ] || { err "nothing stored yet: pin-vault add <name>"; return 66; }
+  if menu_wanted; then menu "$1" $names; return; fi
+  for n in $names; do i=$((i + 1)); echo "  $i) $n" >&2; done
+  ask a "which: " || return 1
+  i=0
+  for n in $names; do
+    i=$((i + 1))
+    if [ "$a" = "$i" ] || [ "$a" = "$n" ]; then printf -v "$1" %s "$n"; return 0; fi
+  done
+  err "not on the list: pin-vault status shows the names"; return 64
+}
+
+# digest <line>...: the SHA-256 of the lines, each ending in a newline.
+digest() { printf '%s\n' "$@" | openssl dgst -sha256 | awk '{print $NF}'; }
+
+# dec <file>: the plaintext of a file under $pin, unchecked.
+dec() {
+  "$wrap" unwrap < "$1" \
+    | openssl enc -d -aes-256-cbc -pbkdf2 -iter "$iter" -md sha256 -pass fd:3 3< <(printf '%s' "$pin") 2>/dev/null
+}
+
+# check <file>: succeeds if the file opens under $pin and is whole. Prints the
+# receiver and nothing else; the token is read and dropped.
+check() {
+  [ -f "$1" ] || return 1
+  dec "$1" | {
+    local m r t n d x
+    IFS= read -r m && IFS= read -r r && IFS= read -r t || exit 1
+    case $m in
+      pin-vault1|pin-vault2) IFS= read -r d || exit 1
+        [ "$d" = "$(digest "$m" "$r" "$t")" ] || exit 1 ;;
+      pin-vault3) IFS= read -r n && IFS= read -r d || exit 1
+        [ "$d" = "$(digest "$m" "$r" "$t" "$n")" ] || exit 1 ;;
+      *) exit 1 ;;
+    esac
+    if IFS= read -r x || [ -n "$x" ]; then exit 1; fi
+    printf '%s\n' "$r"
+  }
+}
+
+# need_pin <name>...: asks until the PIN opens one of those files, three
+# tries. A PIN is wrong only if no file opened. Sets pin, ok_name, ok_recv.
+need_pin() {
+  local try n r
+  for try in 1 2 3; do
+    ask pin "PIN: " s || { err "no PIN given"; return 77; }
+    for n in "$@"; do
+      if r=$(check "$dir/$n.bin"); then ok_name=$n; ok_recv=$r; return 0; fi
+    done
+    [ "$try" -ge 3 ] || echo "  wrong PIN, or the file was changed. $((3 - try)) left." >&2
+  done
+  err "three wrong PINs, closing. Nothing was touched. If the PIN is right the file is damaged or came from another machine: remove $dir/<name>.bin and add it again"
+  return 77
+}
+
+# new_pin: asks for a PIN twice into $pin, at least 6 characters.
+new_pin() {
+  local again
+  ask pin "$1" s && ask again "PIN again: " s || { err "no PIN given"; return 64; }
+  [ "$pin" = "$again" ] || { err "the two PINs differ: nothing stored, run it again"; return 64; }
+  [ ${#pin} -ge 6 ] || { err "a PIN is at least 6 characters: nothing stored, run it again"; return 64; }
+}
+
+# seal <file>: writes $recv, the base64 value $enc and the base64 note
+# $note_enc (empty for none) under $pin, as version 3.
+seal() {
+  local d
+  d=$(digest pin-vault3 "$recv" "$enc" "$note_enc")
+  printf 'pin-vault3\n%s\n%s\n%s\n%s\n' "$recv" "$enc" "$note_enc" "$d" \
+    | openssl enc -e -aes-256-cbc -pbkdf2 -iter "$iter" -md sha256 -salt -pass fd:3 3< <(printf '%s' "$pin") 2>/dev/null \
+    | "$wrap" wrap > "$1"
+}
+
+# store <name>: seals to a temporary name and renames, so a failure leaves the old file.
+store() {
+  local t=$dir/.$1.new
+  mkdir -p "$dir" && chmod 0700 "$dir"
+  if seal "$t" && [ -s "$t" ]; then mv -f "$t" "$dir/$1.bin"
+  else rm -f "$t"; err "could not write $1: nothing changed. Is the outer layer ($wrap) working?"; return 1; fi
+}
+
+# full_receiver: $recv with a full path to its program, because the logon
+# task runs with no PATH from a profile.
+full_receiver() {
+  local -a w
+  local p
+  read -r -a w <<<"$recv"
+  if [ ${#w[@]} -eq 0 ]; then recv=""; return 0; fi
+  case ${w[0]} in
+    /*) ;;
+    *) p=$(command -v "${w[0]}" 2>/dev/null || true)
+       case $p in
+         /*) w[0]=$p ;;
+         *) err "${w[0]} is not on PATH: give the receiver with its full path"; return 64 ;;
+       esac ;;
+  esac
+  recv="${w[*]}"
+}
+
+# deliver <name>: the exact bytes of the value on stdout, a version 2 or 3 one
+# decoded in the pipe, a version 1 token as it was typed.
+deliver() {
+  dec "$dir/$1.bin" | {
+    local m r t
+    IFS= read -r m && IFS= read -r r && IFS= read -r t || exit 1
+    case $m in
+      pin-vault2|pin-vault3) printf '%s' "$t" | openssl base64 -d -A ;;
+      pin-vault1) printf '%s' "$t" ;;
+      *) exit 1 ;;
+    esac
+  }
+}
+
+# deliver_note <name>: the note, decoded in the pipe, and a newline; nothing
+# for an entry with none, which is every version 1 and 2 one.
+deliver_note() {
+  dec "$dir/$1.bin" | {
+    local m r t n
+    IFS= read -r m && IFS= read -r r && IFS= read -r t || exit 1
+    [ "$m" = pin-vault3 ] || exit 0
+    IFS= read -r n || exit 1
+    [ -z "$n" ] || { printf '%s' "$n" | openssl base64 -d -A; echo; }
+  }
+}
+
+# load_rec <name>: the receiver into $recv, the value, as base64, into $enc and
+# the note, as base64, into $note_enc, none of them decoded; a version 1 token
+# is encoded on the way, so what is stored next is version 3.
+load_rec() {
+  local rec m
+  rec=$(dec "$dir/$1.bin") || return 1
+  m=$(printf '%s\n' "$rec" | sed -n 1p)
+  recv=$(printf '%s\n' "$rec" | sed -n 2p)
+  note_enc=""
+  case $m in
+    pin-vault3) enc=$(printf '%s\n' "$rec" | sed -n 3p); note_enc=$(printf '%s\n' "$rec" | sed -n 4p) ;;
+    pin-vault2) enc=$(printf '%s\n' "$rec" | sed -n 3p) ;;
+    pin-vault1) enc=$(printf '%s\n' "$rec" | sed -n 3p | tr -d '\n' | openssl base64 -A) ;;
+    *) return 1 ;;
+  esac
+  [ -n "$enc" ]
+}
+
+# receive <name> <receiver>: the value into the receiver's stdin, in one pipe.
+receive() {
+  local -a argv
+  read -r -a argv <<<"$2"
+  deliver "$1" | "${argv[@]}"
+}
+
+# tty_restore: puts the terminal back as read_value found it.
+tty_restore() {
+  [ -z "$tty_saved" ] || stty "$tty_saved" 2>/dev/null
+  tty_saved=""
+}
+
+# read_value: all of stdin into $enc as base64, refusing none or more than
+# $max_value bytes. At a terminal it is a hidden paste: echo is off until the
+# text is read, and comes back on every way out. Ctrl-C reaches the `openssl`
+# child, not only this shell, so the traps put the terminal back and leave.
+# The cap is on the bytes read, one more than allowed, so a large input is not
+# all read; the size is worked out from the base64 without decoding it.
+read_value() {
+  local n pad rc
+  if [ -t 0 ]; then
+    echo "paste the value, then press Ctrl-D (twice if the text does not end in a newline). Nothing shows." >&2
+    tty_saved=$(stty -g) && stty -echo || { tty_saved=""; err "could not turn echo off: nothing stored"; return 1; }
+    trap 'tty_restore; exit 130' INT TERM HUP
+    trap tty_restore EXIT
+  fi
+  enc=$(head -c $((max_value + 1)) | openssl base64 -A)
+  rc=$?
+  if [ -n "$tty_saved" ]; then
+    tty_restore; echo >&2
+    trap - INT TERM HUP EXIT
+  fi
+  [ $rc -eq 0 ] || { err "could not read the value: nothing stored"; return 1; }
+  [ -n "$enc" ] || { err "no value on stdin: nothing stored"; return 64; }
+  pad=0
+  case $enc in *==) pad=2 ;; *=) pad=1 ;; esac
+  n=$(( ${#enc} / 4 * 3 - pad ))
+  [ $n -le $max_value ] || { enc=""; err "the value is over $max_value bytes: nothing stored"; return 64; }
+}
+
+# note_set <text>: $note_enc from a note, empty for none. A note is one line.
+note_set() {
+  case $1 in *$'\n'*) err "a note is one line: nothing stored"; return 64 ;; esac
+  if [ -n "$1" ]; then note_enc=$(printf '%s' "$1" | openssl base64 -A); else note_enc=""; fi
+}
+
+# read_token: one hidden line into $enc as base64, whitespace stripped.
+read_token() {
+  local tok
+  ask tok "token (hidden): " s || return 1
+  tok=$(printf '%s' "$tok" | tr -d '[:space:]')
+  [ -n "$tok" ] || { err "no token entered: nothing stored"; return 64; }
+  enc=$(printf '%s' "$tok" | openssl base64 -A)
+  tok=""
+}
+
+cmd_add() {
+  local name="" names note="" have_note=0 from_stdin=0 have_recv=0 new_recv=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --stdin) from_stdin=1 ;;
+      --note) [ $# -ge 2 ] || { err "--note needs the text after it"; return 64; }
+              note=$2; have_note=1; shift ;;
+      --receiver) [ $# -ge 2 ] || { err "--receiver needs the command after it"; return 64; }
+                  new_recv=$2; have_recv=1; shift ;;
+      *) if [ -z "$name" ]; then name=$1; else name=""; break; fi ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || { err "usage: pin-vault add <name> [--stdin] [--receiver <command>] [--note <text>]"; return 64; }
+  valid_name "$name" || { err "a name is letters, digits, . _ - and starts with a letter or digit"; return 64; }
+  [ ! -e "$dir/$name.bin" ] || { err "$name is already stored: pin-vault update $name changes one part of it, pin-vault remove $name deletes it"; return 64; }
+  [ $have_note -eq 0 ] || note_set "$note" || return
+  if [ $have_recv -eq 1 ]; then recv=$new_recv; full_receiver || return; fi
+  names=$(list_names)
+  if [ -z "$names" ]; then new_pin "new PIN (6 characters at least; a few words beat digits): " || return
+  else need_pin $names || return; fi
+  if [ $have_recv -eq 0 ]; then
+    ask recv "receiver command, full path (empty for none): " || return 1
+    full_receiver || return
+  fi
+  if [ $have_note -eq 0 ]; then
+    ask note "note, one line (empty for none): " || return 1
+    note_set "$note" || return
+  fi
+  if [ $from_stdin -eq 1 ]; then read_value || return
+  else read_token || return; fi
+  store "$name" || return
+  echo "✓ stored $name"
+}
+
+cmd_get() {
+  local name=${1:-} junk
+  [ -n "$name" ] || pick name || return
+  exists "$name" || return
+  need_pin "$name" || return
+  if [ -t 1 ]; then
+    # The alternate screen leaves nothing in the scrollback, the note's either.
+    printf '\033[?1049h'
+    deliver "$name"
+    printf '\n'
+    deliver_note "$name"
+    printf '(enter to clear) '
+    ask junk "" || true
+    printf '\033[?1049l'
+  else
+    # stdout stays the exact value; the note is for the person reading stderr.
+    deliver_note "$name" >&2
+    deliver "$name"
+  fi
+}
+
+# update_usage: the forms of update, on stderr.
+update_usage() {
+  err "usage: pin-vault update [name] [--receiver <command> | --note <text> | --token [--stdin]]"
+}
+
+# cmd_update [name] [one part flag]: changes one part of an entry, the token,
+# the receiver or the note, and stores the other two as they were. With no
+# flag the arrow menu asks which part; the PIN is asked after, then the new
+# value. Everything that can be refused is, before the PIN.
+cmd_update() {
+  local name="" part="" parts=0 from_stdin=0 flagged=0 new_recv="" new_note="" note=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --receiver|--note)
+        [ $# -ge 2 ] || { err "$1 needs a value after it"; update_usage; return 64; }
+        part=${1#--}; parts=$((parts + 1))
+        if [ "$part" = receiver ]; then new_recv=$2; else note=$2; fi
+        shift ;;
+      --token) part=token; parts=$((parts + 1)) ;;
+      --stdin) from_stdin=1 ;;
+      -*) err "unknown option"; update_usage; return 64 ;;
+      *) if [ -z "$name" ]; then name=$1
+         else err "one name, and a value is never an argument: --token asks for it"; update_usage; return 64; fi ;;
+    esac
+    shift
+  done
+  [ $parts -le 1 ] || { err "one part at a time: --receiver, --note or --token"; update_usage; return 64; }
+  [ $from_stdin -eq 0 ] || [ "$part" = token ] || { err "--stdin is for --token"; update_usage; return 64; }
+  flagged=$parts
+  case $part in
+    receiver) recv=$new_recv; full_receiver || return; new_recv=$recv ;;
+    note) note_set "$note" || return; new_note=$note_enc ;;
+  esac
+  [ -n "$name" ] || pick name || return
+  exists "$name" || return
+  if [ -z "$part" ]; then
+    if menu_wanted; then menu part token receiver note || return 1
+    else
+      ask part "change token, receiver or note: " || return 1
+      case $part in token|receiver|note) ;; *) err "token, receiver or note"; return 64 ;; esac
+    fi
+  fi
+  need_pin "$name" || return
+  load_rec "$name" || { err "could not read $name back: nothing changed"; return 77; }
+  case $part in
+    token) if [ $from_stdin -eq 1 ]; then read_value || return; else read_token || return; fi ;;
+    receiver)
+      if [ $flagged -eq 1 ]; then recv=$new_recv
+      else
+        echo "current receiver: ${recv:-none}" >&2
+        ask recv "new receiver command, full path (empty for none): " || return 1
+        full_receiver || return
+      fi ;;
+    note)
+      if [ $flagged -eq 1 ]; then note_enc=$new_note
+      else
+        ask note "new note, one line (empty for none): " || return 1
+        note_set "$note" || return
+      fi ;;
+  esac
+  store "$name" || return
+  echo "✓ updated the $part of $name"
+}
+
+cmd_remove() {
+  local name=${1:-}
+  [ -n "$name" ] || { err "usage: pin-vault remove <name>"; return 64; }
+  exists "$name" || return
+  need_pin "$name" || return
+  rm -f "$dir/$name.bin" && echo "✓ removed $name"
+}
+
+cmd_status() {
+  local names
+  names=$(list_names)
+  if [ -n "$names" ]; then echo "$names"; else echo "nothing stored yet: pin-vault add <name>"; fi
+}
+
+cmd_unlock() {
+  local names=${1:-} n r failed=0
+  if [ -n "$names" ]; then exists "$names" || return
+  else names=$(list_names); [ -n "$names" ] || { err "nothing stored yet: pin-vault add <name>"; return 66; }; fi
+  need_pin $names || return
+  for n in $names; do
+    if [ "$n" = "$ok_name" ]; then r=$ok_recv
+    elif ! r=$(check "$dir/$n.bin"); then
+      err "$n does not open under this PIN, or the file was changed: not sent. Remove it and add it again"
+      failed=1; continue
+    fi
+    [ -n "$r" ] || { echo "- $n: no receiver, skipped"; continue; }
+    if receive "$n" "$r"; then echo "✓ $n"
+    else err "$n: its receiver failed ($r), see above. pin-vault unlock $n repeats it"; failed=1; fi
+  done
+  return $failed
+}
+
+cmd_repin() {
+  local names n old new t made=""
+  names=$(list_names)
+  [ -n "$names" ] || { err "nothing stored yet: pin-vault add <name>"; return 66; }
+  need_pin $names || return
+  old=$pin
+  for n in $names; do
+    check "$dir/$n.bin" >/dev/null || { err "$n does not open under this PIN: nothing re-encrypted. Remove it and add it again, then repin"; return 77; }
+  done
+  new_pin "new PIN (6 characters at least): " || return
+  new=$pin
+  # Every file to a temporary name first, each opened again under the new PIN;
+  # only then the renames, so a failure leaves no mix of PINs.
+  for n in $names; do
+    t=$dir/.$n.new; made="$made $t"
+    if ! { pin=$old; load_rec "$n" && pin=$new && seal "$t"; } || ! check "$t" >/dev/null; then
+      rm -f $made; err "could not re-encrypt $n: nothing changed"; return 1
+    fi
+  done
+  for n in $names; do mv -f "$dir/.$n.new" "$dir/$n.bin"; done
+  echo "✓ new PIN for $(echo $names | wc -w | tr -d ' ') file(s)"
+}
+
+usage() {
+  cat >&2 <<U
+usage: pin-vault <command>
+  add <name>      store a token, the command that wants it and a note; --receiver <command> and --note <text> skip
+                  their questions (--receiver '' means none),
+                  --stdin takes all of stdin as the value (a key, several lines)
+  get [name]      show a value and its note (to a pipe, the note on stderr, or on the screen until enter); no name picks with the arrow keys
+  update [name]   change one part of an entry and keep the others: the arrow keys ask which, or
+                  --receiver <command>, --note <text> (empty removes it), --token [--stdin]
+  remove <name>   delete one
+  status          the names stored
+  unlock [name]   hand every token (or one) to its receiver
+  repin           change the PIN of every file at once
+U
+  return 64
+}
+
+main() {
+  local cmd=${1:-}
+  command -v openssl >/dev/null || { err "openssl is missing"; return 69; }
+  [ $# -gt 0 ] && shift
+  case $cmd in
+    status) cmd_status ;;
+    edit) err "pin-vault edit is gone: pin-vault update <name> changes the token, the receiver or the note"; return 64 ;;
+    add|get|update|remove|unlock|repin) pick_wrap || return; "cmd_$cmd" "$@" ;;
+    *) usage ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
