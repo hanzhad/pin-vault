@@ -1198,5 +1198,14 @@ assert "install-logon-task.ps1 registers it at logon" grep -q AtLogOn "$INSTALL_
 assert "install-logon-task.ps1 accepts -InstallDir" grep -q 'InstallDir' "$INSTALL_LOGON"
 assert "install-logon-task.ps1 starts logon.sh" grep -q 'logon[.]sh' "$INSTALL_LOGON"
 
+echo "== help flags =="
+pv "" --help
+assert "--help exits 0" test "$rc" -eq 0
+assert "--help prints usage to stdout" grep -q "^usage: pin-vault" "$tmp/out"
+assert "--help prints nothing to stderr" test ! -s "$tmp/err"
+pv "" -h
+assert "-h exits 0" test "$rc" -eq 0
+assert "-h prints usage to stdout" grep -q "^usage: pin-vault" "$tmp/out"
+
 [ "$fail" = 0 ] && echo "all pin-vault checks passed" || echo "pin-vault checks FAILED"
 exit "$fail"

@@ -555,8 +555,8 @@ cmd_repin() {
   echo "✓ new PIN for $(echo $names | wc -w | tr -d ' ') file(s)"
 }
 
-usage() {
-  cat >&2 <<U
+usage_text() {
+  cat <<U
 usage: pin-vault <command>
   add <name>      store a token, the command that wants it and a note; --receiver <command> and --note <text> skip
                   their questions (--receiver '' means none),
@@ -569,11 +569,18 @@ usage: pin-vault <command>
   unlock [name]   hand every token (or one) to its receiver
   repin           change the PIN of every file at once
 U
+}
+
+usage() {
+  usage_text >&2
   return 64
 }
 
 main() {
   local cmd=${1:-}
+  case $cmd in
+    -h|--help) usage_text; return 0 ;;
+  esac
   command -v openssl >/dev/null || { err "openssl is missing"; return 69; }
   [ $# -gt 0 ] && shift
   case $cmd in
